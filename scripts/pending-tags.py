@@ -240,6 +240,49 @@ def publish_source(item, output, manifest):
             command(['gh', 'release', 'upload', item['image_tag'], str(path), '--repo', item['repository']])
 
 
+def promote_latest():
+    config = configuration()
+    baseline = identity(config['base_tag'], config['base_sha'])
+    repository = baseline['repository']
+    pages = json.loads(command(['gh', 'api', '--paginate', '--slurp',
+                                f'repos/{repository}/releases?per_page=100']))
+    candidates = []
+    for page in pages:
+        for release in page:
+            match = re.fullmatch(r'(v[0-9]+\.[0-9]+\.[0-9]+)-fb2zip\.([1-9][0-9]*)', release['tag_name'])
+            if match and not release['draft'] and not release['prerelease']:
+                candidates.append((version(match[1]), int(match[2]), release))
+    # Read releases while holding the workflow's shared latest lock. Completion
+    # order and retries of older versions must not move latest backwards.
+    for _, revision, release in sorted(candidates, key=lambda c: c[:2], reverse=True):
+        assets = {asset['name']: asset for asset in release['assets']}
+        if not {'build-manifest.json', 'patched-source.tar.gz'} <= assets.keys():
+            continue
+        manifest = json.loads(command(['gh', 'api',
+            f"repos/{repository}/releases/assets/{assets['build-manifest.json']['id']}",
+            '-H', 'Accept: application/octet-stream']))
+        if not manifest.get('image_digest'):
+            continue
+        expected = dict(repository=repository, image=baseline['image'],
+                        image_tag=release['tag_name'], patch_revision=revision,
+                        upstream_tag=release['tag_name'].split('-fb2zip.')[0])
+        if any(manifest.get(key) != value for key, value in expected.items()):
+            raise ValueError('latest release identity conflict')
+        state = image_state(manifest)
+        if state != dict(digest=manifest['image_digest'], patch_commit=manifest['patch_commit']):
+            raise ValueError('latest release does not match its published image')
+        credentials = os.environ['GITHUB_ACTOR'] + ':' + os.environ['GH_TOKEN']
+        command(['skopeo', 'copy', '--all', '--preserve-digests',
+                 '--src-creds', credentials, '--dest-creds', credentials,
+                 f"docker://{manifest['image']}@{state['digest']}",
+                 f"docker://{manifest['image']}:latest"])
+        if image_state(dict(manifest, image_tag='latest')) != state:
+            raise ValueError('latest digest verification failed')
+        print(f"latest -> {manifest['image_tag']} ({state['digest']})")
+        return
+    print('No completed publication; latest unchanged')
+
+
 def output_values(values):
     with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
         for key, value in values.items():
@@ -248,7 +291,7 @@ def output_values(values):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('operation', choices=['discover', 'state', 'source', 'finalize'])
+    parser.add_argument('operation', choices=['discover', 'state', 'source', 'finalize', 'latest'])
     parser.add_argument('--tag', default='')
     parser.add_argument('--sha', default='')
     parser.add_argument('--publish', action='store_true')
@@ -258,6 +301,11 @@ def main():
     if args.publish and (os.environ.get('GITHUB_REF') != 'refs/heads/' + os.environ.get('DEFAULT_BRANCH', '')
                          or os.environ.get('GITHUB_EVENT_NAME') not in ('schedule', 'workflow_dispatch')):
         raise ValueError('publication requires a scheduled/manual run on the default branch')
+    if args.operation == 'latest':
+        if not args.publish:
+            raise ValueError('latest requires --publish')
+        promote_latest()
+        return
     if args.operation == 'discover':
         pending = discover(args.tag)
         print(json.dumps(pending))

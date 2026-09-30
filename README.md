@@ -15,7 +15,10 @@ image: ghcr.io/kemko/grimmory-fb2zip:v3.5.0-fb2zip.1
 
 Keep the upstream database,
 volumes and environment configuration, then pull and recreate the application
-service. Images target `linux/amd64` and `linux/arm64`; no `latest` tag is published.
+service. Images target `linux/amd64` and `linux/arm64`. The `latest` tag follows the
+highest successfully published upstream version and patch revision. Use an exact
+tag for controlled upgrades, or `ghcr.io/kemko/grimmory-fb2zip:latest` for automatic
+version selection when pulling.
 Back up the database before upgrading. Changing the image tag does not undo
 upstream database migrations.
 
@@ -103,6 +106,12 @@ every hour at minute 17. Tags are sorted numerically, including annotated tags;
 a GitHub Release in upstream is not required. `publish-version.yml` runs the
 reusable checks and build for each pending version independently, with at most
 two versions running at once. One failure does not cancel the other versions.
+After the version jobs finish, a separate serialized job updates `latest` from
+completed releases, including when another version fails or no new tags need a
+build. It copies the full image index by digest and verifies both architectures;
+older retries cannot replace a newer published version. Dry runs leave `latest`
+unchanged. An interrupted update is recovered by the next scheduled or manual
+publication run. This also adds `latest` to images published before this feature.
 More than 256 pending versions fails explicitly; process selected tags manually
 before resuming polling.
 

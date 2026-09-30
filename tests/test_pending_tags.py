@@ -265,6 +265,96 @@ class PendingTagsTest(unittest.TestCase):
             publish.assert_not_called()
         self.assertTrue((self.root / '.work/release/build-manifest.json').is_file())
 
+    def latest_fixtures(self, entries):
+        releases, manifests = [], {}
+        for tag, revision, digest in entries:
+            name = f'{tag}-fb2zip.{revision}'
+            manifests[name] = dict(self.item, upstream_tag=tag, patch_revision=revision,
+                                   image_tag=name, image_digest=digest, patch_commit=COMMIT)
+            releases.append(dict(tag_name=name, draft=False, prerelease=False, assets=[
+                dict(name='build-manifest.json', id=name), dict(name='patched-source.tar.gz')]))
+        def response(args):
+            if '--paginate' in args:
+                return json.dumps([[release] for release in releases])
+            if args[:2] == ['gh', 'api']:
+                return json.dumps(manifests[args[2].split('/')[-1]])
+            return ''
+        return releases, manifests, response
+
+    def test_latest_selects_numeric_version_then_revision_across_pages(self):
+        for entries in [
+            [('v3.10.0', 1, DIGEST), ('v3.9.0', 20, DIGEST)],
+            [('v3.10.0', 10, DIGEST), ('v3.10.0', 9, DIGEST)],
+        ]:
+            with self.subTest(entries=entries):
+                releases, manifests, response = self.latest_fixtures(entries)
+                with patch.object(tags, 'command', side_effect=response) as cmd, \
+                     patch.object(tags, 'image_state', return_value=dict(digest=DIGEST, patch_commit=COMMIT)) as inspect, \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    tags.promote_latest()
+                self.assertEqual(inspect.call_args_list[0].args[0]['image_tag'], releases[0]['tag_name'])
+                self.assertEqual(inspect.call_args_list[1].args[0]['image_tag'], 'latest')
+                copy = cmd.call_args_list[-1].args[0]
+                self.assertEqual(copy[:4], ['skopeo', 'copy', '--all', '--preserve-digests'])
+                self.assertEqual(copy[-2:], [f"docker://{self.item['image']}@{DIGEST}",
+                                            f"docker://{self.item['image']}:latest"])
+
+    def test_latest_ignores_incomplete_draft_and_prerelease_publications(self):
+        releases, manifests, response = self.latest_fixtures([
+            ('v3.5.0', 1, DIGEST), ('v3.6.0', 1, None), ('v3.7.0', 1, DIGEST),
+            ('v3.8.0', 1, DIGEST), ('v3.9.0', 1, DIGEST)])
+        releases[2]['draft'] = True
+        releases[3]['prerelease'] = True
+        releases[4]['assets'].pop()
+        with patch.object(tags, 'command', side_effect=response), \
+             patch.object(tags, 'image_state', return_value=dict(digest=DIGEST, patch_commit=COMMIT)) as inspect, \
+             contextlib.redirect_stdout(io.StringIO()):
+            tags.promote_latest()
+        self.assertEqual(inspect.call_args_list[0].args[0]['image_tag'], releases[0]['tag_name'])
+
+    def test_latest_without_completed_release_does_not_touch_registry(self):
+        _, _, response = self.latest_fixtures([('v3.5.0', 1, None)])
+        with patch.object(tags, 'command', side_effect=response) as cmd, \
+             patch.object(tags, 'image_state') as inspect, contextlib.redirect_stdout(io.StringIO()):
+            tags.promote_latest()
+        inspect.assert_not_called()
+        self.assertTrue(all(call.args[0][0] == 'gh' for call in cmd.call_args_list))
+
+    def test_latest_rejects_wrong_identity_or_registry_state_before_copy(self):
+        for field, value in [('image', 'ghcr.io/other/package'), ('patch_revision', 2),
+                             ('image_digest', 'sha256:' + 'e' * 64), ('patch_commit', SHA)]:
+            releases, manifests, response = self.latest_fixtures([('v3.5.0', 1, DIGEST)])
+            manifests[releases[0]['tag_name']][field] = value
+            with self.subTest(field=field), patch.object(tags, 'command', side_effect=response) as cmd, \
+                 patch.object(tags, 'image_state', return_value=dict(digest=DIGEST, patch_commit=COMMIT)), \
+                 self.assertRaises(ValueError):
+                tags.promote_latest()
+            self.assertTrue(all(call.args[0][0] == 'gh' for call in cmd.call_args_list))
+
+    def test_latest_propagates_missing_image_and_registry_errors(self):
+        for state in [None, RuntimeError('registry unavailable')]:
+            _, _, response = self.latest_fixtures([('v3.5.0', 1, DIGEST)])
+            with self.subTest(state=state), patch.object(tags, 'command', side_effect=response) as cmd, \
+                 patch.object(tags, 'image_state', side_effect=[state]), \
+                 self.assertRaises((ValueError, RuntimeError)):
+                tags.promote_latest()
+            self.assertTrue(all(call.args[0][0] == 'gh' for call in cmd.call_args_list))
+
+    def test_latest_checks_destination_digest_after_copy(self):
+        _, _, response = self.latest_fixtures([('v3.5.0', 1, DIGEST)])
+        with patch.object(tags, 'command', side_effect=response), \
+             patch.object(tags, 'image_state', side_effect=[dict(digest=DIGEST, patch_commit=COMMIT), None]), \
+             self.assertRaisesRegex(ValueError, 'verification failed'):
+            tags.promote_latest()
+
+    def test_latest_requires_publish_and_default_branch(self):
+        for args, env in [(['latest'], {}), (['latest', '--publish'], {'GITHUB_EVENT_NAME': 'pull_request'}),
+                          (['latest', '--publish'], {'GITHUB_REF': 'refs/heads/other'})]:
+            with patch.dict(os.environ, env), patch.object(tags.sys, 'argv', ['pending-tags.py', *args]), \
+                 patch.object(tags, 'promote_latest') as promote, self.assertRaises(ValueError):
+                tags.main()
+            promote.assert_not_called()
+
     def test_finalize_recovers_after_image_push_without_rebuilding(self):
         with patch.object(tags, 'image_state', return_value=dict(digest=DIGEST, patch_commit=COMMIT)), \
              patch.object(tags, 'release_info', return_value={'assets': [{'name': 'patched-source.tar.gz'}]}), \
