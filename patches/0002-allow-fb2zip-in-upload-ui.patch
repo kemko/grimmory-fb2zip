@@ -1,9 +1,9 @@
 Subject: Accept FB2 ZIP uploads through both book upload widgets
 Depends-on: 0001-normalize-fb2zip-uploads.patch
 
-Optimus UI validates only the final suffix. Adapt each upload instance to
-recognize .fb2.zip while keeping the existing accept and size validation.
-The server patch validates and normalizes these archives before storage.
+Use .zip for native file pickers, which may not recognize compound extensions.
+Validate the full .fb2.zip suffix for book uploads, preserving size validation
+and unrestricted supplementary attachments. The server validates the archive.
 
 diff --git c/frontend/src/app/features/book/components/additional-file-uploader/additional-file-uploader.component.html w/frontend/src/app/features/book/components/additional-file-uploader/additional-file-uploader.component.html
 index 00d1427..b6a1f2b 100644
@@ -19,7 +19,7 @@ index 00d1427..b6a1f2b 100644
      [multiple]="false"
      [accept]="acceptedFormats"
 diff --git c/frontend/src/app/features/book/components/additional-file-uploader/additional-file-uploader.component.spec.ts w/frontend/src/app/features/book/components/additional-file-uploader/additional-file-uploader.component.spec.ts
-index 80fea9b..f360400 100644
+index 80fea9b..a28262c 100644
 --- c/frontend/src/app/features/book/components/additional-file-uploader/additional-file-uploader.component.spec.ts
 +++ w/frontend/src/app/features/book/components/additional-file-uploader/additional-file-uploader.component.spec.ts
 @@ -1,4 +1,18 @@
@@ -42,7 +42,7 @@ index 80fea9b..f360400 100644
  
  // NOTE(frontend-seam): Real coverage here needs seams around Optimus UI file-upload callbacks,
  // dialog bootstrapping, and upload stream orchestration so single-file validation and upload state
-@@ -12,3 +26,69 @@ describe.skip('AdditionalFileUploaderComponent', () => {
+@@ -12,3 +26,78 @@ describe.skip('AdditionalFileUploaderComponent', () => {
      // TODO(seam): Cover uploadFiles and closeDialog after BookFileService streams and dialog refs are exposed through a stable test harness.
    });
  });
@@ -70,6 +70,16 @@ index 80fea9b..f360400 100644
 +    upload = fixture.debugElement.query(By.directive(FileUpload)).componentInstance;
 +  });
 +
++  it('passes a simple ZIP extension to the native Choose dialog', () => {
++    const input: HTMLInputElement = fixture.nativeElement.querySelector('input[type=file]');
++    const click = vi.spyOn(input, 'click').mockImplementation(() => {
++      expect(input.accept.split(',')).toContain('.zip');
++      expect(input.accept.split(',')).not.toContain('.fb2.zip');
++    });
++    upload.choose();
++    expect(click).toHaveBeenCalledOnce();
++  });
++
 +  for (const method of ['select', 'drop']) {
 +    it(`passes the original uppercase FB2 ZIP to the service after ${method}`, () => {
 +      const file = new File(['archive bytes'], 'Книга.FB2.ZIP', {type: 'application/zip'});
@@ -83,8 +93,7 @@ index 80fea9b..f360400 100644
 +        upload.content!.nativeElement.dispatchEvent(event);
 +      }
 +      expect(upload.files).toEqual([file]);
-+      expect(upload.accept?.split(',')).toContain('.fb2.zip');
-+      expect(upload.accept?.split(',')).not.toContain('.zip');
++      expect(fixture.nativeElement.querySelector('input[type=file]').accept.split(',')).toContain('.zip');
 +      upload.upload();
 +      expect(uploadAdditionalFile).toHaveBeenCalledWith(42, file, AdditionalFileType.ALTERNATIVE_FORMAT);
 +    });
@@ -113,7 +122,7 @@ index 80fea9b..f360400 100644
 +  });
 +});
 diff --git c/frontend/src/app/features/book/components/additional-file-uploader/additional-file-uploader.component.ts w/frontend/src/app/features/book/components/additional-file-uploader/additional-file-uploader.component.ts
-index c83a4f4..a5d6a90 100644
+index c83a4f4..9179456 100644
 --- c/frontend/src/app/features/book/components/additional-file-uploader/additional-file-uploader.component.ts
 +++ w/frontend/src/app/features/book/components/additional-file-uploader/additional-file-uploader.component.ts
 @@ -1,3 +1,4 @@
@@ -134,12 +143,12 @@ index c83a4f4..a5d6a90 100644
    isUploading = false;
    readonly AdditionalFileType = AdditionalFileType;
 -  private static readonly BOOK_FORMAT_ACCEPT = '.pdf,.epub,.cbz,.cbr,.cb7,.fb2,.mobi,.azw,.azw3,.m4b,.m4a,.mp3,.opus';
-+  private static readonly BOOK_FORMAT_ACCEPT = '.pdf,.epub,.cbz,.cbr,.cb7,.fb2,.fb2.zip,.mobi,.azw,.azw3,.m4b,.m4a,.mp3,.opus';
++  private static readonly BOOK_FORMAT_ACCEPT = '.pdf,.epub,.cbz,.cbr,.cb7,.fb2,.zip,.mobi,.azw,.azw3,.m4b,.m4a,.mp3,.opus';
    maxFileSizeBytes?: number;
    maxFileSizeDisplay: string = '100 MB';
  
 diff --git c/frontend/src/app/shared/components/book-uploader/book-uploader.component.html w/frontend/src/app/shared/components/book-uploader/book-uploader.component.html
-index e8ef638..ab8fc94 100644
+index e8ef638..b45e6d0 100644
 --- c/frontend/src/app/shared/components/book-uploader/book-uploader.component.html
 +++ w/frontend/src/app/shared/components/book-uploader/book-uploader.component.html
 @@ -85,11 +85,11 @@
@@ -152,12 +161,12 @@ index e8ef638..ab8fc94 100644
            [customUpload]="true"
            [multiple]="true"
 -          accept=".pdf,.epub,.cbz,.cbr,.cb7,.fb2,.mobi,.azw,.azw3,.m4b,.m4a,.mp3,.opus"
-+          accept=".pdf,.epub,.cbz,.cbr,.cb7,.fb2,.fb2.zip,.mobi,.azw,.azw3,.m4b,.m4a,.mp3,.opus"
++          accept=".pdf,.epub,.cbz,.cbr,.cb7,.fb2,.zip,.mobi,.azw,.azw3,.m4b,.m4a,.mp3,.opus"
            (onSelect)="onFilesSelect($event)"
            (uploadHandler)="uploadFiles($event)">
            <ng-template #header let-files let-chooseCallback="chooseCallback" let-clearCallback="clearCallback" let-uploadCallback="uploadCallback">
 diff --git c/frontend/src/app/shared/components/book-uploader/book-uploader.component.spec.ts w/frontend/src/app/shared/components/book-uploader/book-uploader.component.spec.ts
-index fc3a76b..50c9c67 100644
+index fc3a76b..0f9b8c2 100644
 --- c/frontend/src/app/shared/components/book-uploader/book-uploader.component.spec.ts
 +++ w/frontend/src/app/shared/components/book-uploader/book-uploader.component.spec.ts
 @@ -1,4 +1,15 @@
@@ -177,7 +186,7 @@ index fc3a76b..50c9c67 100644
  
  // NOTE(frontend-seam): Honest coverage for this component needs an Optimus UI FileUpload host seam,
  // controllable library/settings signals, and a stable upload-progress harness for `HttpRequest`
-@@ -15,3 +26,71 @@ describe.skip('BookUploaderComponent', () => {
+@@ -15,3 +26,80 @@ describe.skip('BookUploaderComponent', () => {
      // driven without coupling the spec to the full Optimus UI/http runtime.
    });
  });
@@ -204,6 +213,16 @@ index fc3a76b..50c9c67 100644
 +    await fixture.whenStable();
 +  });
 +
++  it('passes a simple ZIP extension to the native Choose dialog', () => {
++    const input: HTMLInputElement = fixture.nativeElement.querySelector('input[type=file]');
++    const click = vi.spyOn(input, 'click').mockImplementation(() => {
++      expect(input.accept.split(',')).toContain('.zip');
++      expect(input.accept.split(',')).not.toContain('.fb2.zip');
++    });
++    fixture.componentInstance.fileUpload.choose();
++    expect(click).toHaveBeenCalledOnce();
++  });
++
 +  for (const destination of ['library', 'bookdrop']) {
 +    for (const method of ['select', 'drop']) {
 +      it(`uploads an uppercase FB2 ZIP to ${destination} after ${method}`, () => {
@@ -222,8 +241,7 @@ index fc3a76b..50c9c67 100644
 +        }
 +        expect(component.fileUpload.files).toEqual([file]);
 +        expect(component.files[0].file).toBe(file);
-+        expect(component.fileUpload.accept?.split(',')).toContain('.fb2.zip');
-+        expect(component.fileUpload.accept?.split(',')).not.toContain('.zip');
++        expect(fixture.nativeElement.querySelector('input[type=file]').accept.split(',')).toContain('.zip');
 +        component.fileUpload.upload();
 +        const request = http.expectOne(req => req.url.endsWith(destination === 'library'
 +          ? '/api/v1/files/upload' : '/api/v1/files/upload/bookdrop'));
@@ -266,12 +284,12 @@ index 8649b72..1979e00 100644
      Button,
      FormsModule,
      Select,
-diff --git 1/frontend/src/app/shared/directives/fb2-zip-upload.directive.ts 2/frontend/src/app/shared/directives/fb2-zip-upload.directive.ts
+diff --git c/frontend/src/app/shared/directives/fb2-zip-upload.directive.ts w/frontend/src/app/shared/directives/fb2-zip-upload.directive.ts
 new file mode 100644
-index 0000000..509843f
+index 0000000..3b641df
 --- /dev/null
-+++ 2/frontend/src/app/shared/directives/fb2-zip-upload.directive.ts
-@@ -0,0 +1,17 @@
++++ w/frontend/src/app/shared/directives/fb2-zip-upload.directive.ts
+@@ -0,0 +1,25 @@
 +import {Directive, inject} from '@angular/core';
 +import {FileUpload} from '@openng/optimus-ui/fileupload';
 +
@@ -282,10 +300,18 @@ index 0000000..509843f
 +export class Fb2ZipUploadDirective {
 +  constructor() {
 +    const upload = inject(FileUpload, {self: true});
-+    const getFileExtension = upload.getFileExtension.bind(upload);
-+    // Optimus UI checks only the last suffix, so its accept filter needs this compound extension.
-+    upload.getFileExtension = (file: File) => file.name.toLowerCase().endsWith('.fb2.zip')
-+      ? '.fb2.zip'
-+      : getFileExtension(file);
++    const validate = upload.validate.bind(upload);
++    upload.validate = (file: File) => {
++      const name = file.name.toLowerCase();
++      // Native file pickers need .zip; book uploads still require the full .fb2.zip suffix.
++      if (upload.accept?.split(',').includes('.zip') && name.endsWith('.zip') && !name.endsWith('.fb2.zip')) {
++        const summary = upload.invalidFileTypeMessageSummary.replace('{0}', file.name);
++        const detail = upload.invalidFileTypeMessageDetail.replace('{0}', upload.accept.replace('.zip', '.fb2.zip'));
++        upload.msgs ??= [];
++        upload.msgs.push({severity: 'error', text: `${summary} ${detail}`});
++        return false;
++      }
++      return validate(file);
++    };
 +  }
 +}

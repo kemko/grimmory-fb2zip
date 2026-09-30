@@ -10,7 +10,7 @@ After the repository owner publishes the package, replace the image in your
 existing Grimmory Compose configuration with an exact tag:
 
 ```yaml
-image: ghcr.io/kemko/grimmory-fb2zip:v3.5.0-fb2zip.1
+image: ghcr.io/kemko/grimmory-fb2zip:v3.5.0-fb2zip.2
 ```
 
 Keep the upstream database,
@@ -30,6 +30,13 @@ The package name is `grimmory-fb2zip`, independent of the repository name.
 Publishing uses `GITHUB_TOKEN`; it needs no separate PAT.
 
 ## Supported uploads and limits
+
+The native **Choose** dialog allows `.zip`, because compound extensions such as
+`.fb2.zip` are not handled consistently by system file pickers. The upload widget
+then checks the full filename: ordinary ZIP files are rejected as books but
+remain allowed as supplementary attachments. The browser's
+[`accept` filter is a hint](https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Attributes/accept),
+so the server also checks the archive contents.
 
 The patch handles library uploads, HTTP BookDrop uploads, alternative book files
 and the first file attached to a physical book. Supplementary attachments keep
@@ -153,8 +160,8 @@ changes within upload handling, and export the updated patches with their tests.
 Do not edit the original Grimmory checkout or commit generated build files.
 
 When any patch bytes or application order change, increment `patch_revision` in
-`upstream.json`. For example, revision 2 produces
-`v3.5.0-fb2zip.2` for the same upstream version. README-only changes do not require
+`upstream.json`. For example, revision 3 produces
+`v3.5.0-fb2zip.3` for the same upstream version. README-only changes do not require
 a new image. Keep the verified baseline SHA; update the baseline or minimum tag
 only deliberately after validating the new supported range. Reapply the series
 to a new destination and run the relevant local checks below, then use the manual
@@ -275,3 +282,10 @@ upload, metadata, embedded cover, exact download, rename and rescan, BookDrop
 finalization, physical first file, alternative format and unchanged attachment.
 The final filesystem contained four `.fb2` books and only the explicitly uploaded
 supplementary `.fb2.zip` attachment. Compose resources were removed after testing.
+
+Revision 2 fixes the native Choose filter. The two upload-widget test suites
+verify the actual file input's `accept` when `choose()` clicks it, selection and
+drag-and-drop, rejection of ordinary ZIPs, and supplementary attachments.
+Revision 2 passed 11 upload-widget tests (4 existing skips), TypeScript checks,
+ESLint, the production frontend build, 51 infrastructure tests and clean patch
+application. These tests do not automate the operating system's native file picker.
