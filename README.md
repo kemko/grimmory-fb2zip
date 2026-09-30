@@ -10,19 +10,19 @@ After the repository owner publishes the package, replace the image in your
 existing Grimmory Compose configuration with an exact tag:
 
 ```yaml
-image: ghcr.io/<owner>/grimmory-fb2zip:v3.5.0-fb2zip.1
+image: ghcr.io/kemko/grimmory-fb2zip:v3.5.0-fb2zip.1
 ```
 
-Replace `<owner>` with the lowercase GitHub owner. Keep the upstream database,
+Keep the upstream database,
 volumes and environment configuration, then pull and recreate the application
 service. Images target `linux/amd64` and `linux/arm64`; no `latest` tag is published.
 Back up the database before upgrading. Changing the image tag does not undo
 upstream database migrations.
 
-This local implementation has not published a GitHub repository or image yet.
-Before first publication, choose the owner and repository, enable Actions on its
-default branch. After the first package is created, configure its visibility and
-repository access; verify anonymous pulls if the package should be public.
+Source and workflows are maintained in [kemko/grimmory-fb2zip](https://github.com/kemko/grimmory-fb2zip).
+Check its releases and Actions runs for published images. For a new fork, enable
+Actions on the default branch. After the first package is created, configure its
+visibility and repository access; verify anonymous pulls if it should be public.
 The package name is `grimmory-fb2zip`, independent of the repository name.
 Publishing uses `GITHUB_TOKEN`; it needs no separate PAT.
 
