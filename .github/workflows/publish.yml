@@ -1,0 +1,63 @@
+name: Publish patched versions
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: Stable tag (empty checks all supported tags)
+        type: string
+        default: ''
+      dry_run:
+        description: Run checks and build without publishing
+        type: boolean
+        default: true
+      bootstrap_package:
+        description: First publication only; assert that this GHCR package is new (requires a tag)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      matrix: ${{ steps.tags.outputs.matrix }}
+      count: ${{ steps.tags.outputs.count }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install registry client
+        run: sudo apt-get update && sudo apt-get install --yes skopeo
+      - name: Discover every pending version
+        id: tags
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          BOOTSTRAP_PACKAGE: ${{ inputs.bootstrap_package || false }}
+          UPSTREAM_TAG: ${{ inputs.upstream_tag }}
+        run: python3 scripts/pending-tags.py discover --tag "$UPSTREAM_TAG"
+  versions:
+    needs: discover
+    if: needs.discover.outputs.count != '0'
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
+    permissions:
+      contents: write
+      packages: write
+    uses: ./.github/workflows/publish-version.yml
+    with:
+      upstream_tag: ${{ matrix.tag }}
+      upstream_sha: ${{ matrix.sha }}
+      dry_run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+      bootstrap_package: ${{ inputs.bootstrap_package || false }}

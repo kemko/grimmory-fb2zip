@@ -1,0 +1,291 @@
+Subject: Accept FB2 ZIP uploads through both book upload widgets
+Depends-on: 0001-normalize-fb2zip-uploads.patch
+
+Optimus UI validates only the final suffix. Adapt each upload instance to
+recognize .fb2.zip while keeping the existing accept and size validation.
+The server patch validates and normalizes these archives before storage.
+
+diff --git c/frontend/src/app/features/book/components/additional-file-uploader/additional-file-uploader.component.html w/frontend/src/app/features/book/components/additional-file-uploader/additional-file-uploader.component.html
+index 00d1427..b6a1f2b 100644
+--- c/frontend/src/app/features/book/components/additional-file-uploader/additional-file-uploader.component.html
++++ w/frontend/src/app/features/book/components/additional-file-uploader/additional-file-uploader.component.html
+@@ -32,7 +32,7 @@
+   ></p-select>
+ 
+   <!-- File Upload -->
+-  <p-fileupload class="file-upload" name="file"
++  <p-fileupload appFb2ZipUpload class="file-upload" name="file"
+     [customUpload]="true"
+     [multiple]="false"
+     [accept]="acceptedFormats"
+diff --git c/frontend/src/app/features/book/components/additional-file-uploader/additional-file-uploader.component.spec.ts w/frontend/src/app/features/book/components/additional-file-uploader/additional-file-uploader.component.spec.ts
+index 80fea9b..f360400 100644
+--- c/frontend/src/app/features/book/components/additional-file-uploader/additional-file-uploader.component.spec.ts
++++ w/frontend/src/app/features/book/components/additional-file-uploader/additional-file-uploader.component.spec.ts
+@@ -1,4 +1,18 @@
+-import {describe, it} from 'vitest';
++import {beforeEach, describe, expect, it, vi} from 'vitest';
++import {signal} from '@angular/core';
++import {ComponentFixture, TestBed} from '@angular/core/testing';
++import {provideHttpClient} from '@angular/common/http';
++import {By} from '@angular/platform-browser';
++import {NEVER} from 'rxjs';
++import {MessageService} from '@openng/optimus-ui/api';
++import {DynamicDialogConfig, DynamicDialogRef} from '@openng/optimus-ui/dynamicdialog';
++import {FileUpload} from '@openng/optimus-ui/fileupload';
++import {AdditionalFileUploaderComponent} from './additional-file-uploader.component';
++import {BookFileService} from '../../service/book-file.service';
++import {AdditionalFileType} from '../../model/book.model';
++import {AppSettingsService} from '../../../../shared/service/app-settings.service';
++import {getTranslocoModule} from '../../../../core/testing/transloco-testing';
++
+ 
+ // NOTE(frontend-seam): Real coverage here needs seams around Optimus UI file-upload callbacks,
+ // dialog bootstrapping, and upload stream orchestration so single-file validation and upload state
+@@ -12,3 +26,69 @@ describe.skip('AdditionalFileUploaderComponent', () => {
+     // TODO(seam): Cover uploadFiles and closeDialog after BookFileService streams and dialog refs are exposed through a stable test harness.
+   });
+ });
++
++describe('AdditionalFileUploaderComponent FB2 ZIP uploads', () => {
++  let fixture: ComponentFixture<AdditionalFileUploaderComponent>;
++  let upload: FileUpload;
++  const uploadAdditionalFile = vi.fn(() => NEVER);
++
++  beforeEach(async () => {
++    uploadAdditionalFile.mockClear();
++    await TestBed.configureTestingModule({
++      imports: [AdditionalFileUploaderComponent, getTranslocoModule()],
++      providers: [
++        provideHttpClient(), MessageService,
++        {provide: DynamicDialogRef, useValue: {close: vi.fn()}},
++        {provide: DynamicDialogConfig, useValue: {data: {book: {id: 42}}}},
++        {provide: BookFileService, useValue: {uploadAdditionalFile}},
++        {provide: AppSettingsService, useValue: {appSettings: signal({maxFileUploadSizeInMb: 100})}}
++      ]
++    }).compileComponents();
++    fixture = TestBed.createComponent(AdditionalFileUploaderComponent);
++    fixture.detectChanges();
++    await fixture.whenStable();
++    upload = fixture.debugElement.query(By.directive(FileUpload)).componentInstance;
++  });
++
++  for (const method of ['select', 'drop']) {
++    it(`passes the original uppercase FB2 ZIP to the service after ${method}`, () => {
++      const file = new File(['archive bytes'], 'Книга.FB2.ZIP', {type: 'application/zip'});
++      if (method === 'select') {
++        const input = fixture.nativeElement.querySelector('input[type=file]');
++        Object.defineProperty(input, 'files', {value: [file]});
++        input.dispatchEvent(new Event('change'));
++      } else {
++        const event = new Event('drop', {bubbles: true, cancelable: true});
++        Object.defineProperty(event, 'dataTransfer', {value: {files: [file]}});
++        upload.content!.nativeElement.dispatchEvent(event);
++      }
++      expect(upload.files).toEqual([file]);
++      expect(upload.accept?.split(',')).toContain('.fb2.zip');
++      expect(upload.accept?.split(',')).not.toContain('.zip');
++      upload.upload();
++      expect(uploadAdditionalFile).toHaveBeenCalledWith(42, file, AdditionalFileType.ALTERNATIVE_FORMAT);
++    });
++  }
++
++  it('rejects unrelated ZIP files as books and preserves ordinary formats', () => {
++    expect(upload.validate(new File(['bytes'], 'book.zip'))).toBe(false);
++    expect(upload.validate(new File(['bytes'], 'book.fb2.zip.exe'))).toBe(false);
++    for (const name of ['book.fb2.zip', 'plain.fb2', 'plain.epub', 'plain.pdf']) {
++      expect(upload.validate(new File(['bytes'], name))).toBe(true);
++    }
++    expect(uploadAdditionalFile).not.toHaveBeenCalled();
++  });
++
++  it('still uploads arbitrary ZIP files as supplementary attachments', () => {
++    fixture.componentInstance.fileType = AdditionalFileType.SUPPLEMENTARY;
++    fixture.componentInstance.onFileTypeChange();
++    fixture.detectChanges();
++    const file = new File(['attachment bytes'], 'attachment.zip', {type: 'application/zip'});
++    const input = fixture.nativeElement.querySelector('input[type=file]');
++    Object.defineProperty(input, 'files', {value: [file]});
++    input.dispatchEvent(new Event('change'));
++    expect(upload.files).toEqual([file]);
++    upload.upload();
++    expect(uploadAdditionalFile).toHaveBeenCalledWith(42, file, AdditionalFileType.SUPPLEMENTARY);
++  });
++});
+diff --git c/frontend/src/app/features/book/components/additional-file-uploader/additional-file-uploader.component.ts w/frontend/src/app/features/book/components/additional-file-uploader/additional-file-uploader.component.ts
+index c83a4f4..a5d6a90 100644
+--- c/frontend/src/app/features/book/components/additional-file-uploader/additional-file-uploader.component.ts
++++ w/frontend/src/app/features/book/components/additional-file-uploader/additional-file-uploader.component.ts
+@@ -1,3 +1,4 @@
++import {Fb2ZipUploadDirective} from '../../../../shared/directives/fb2-zip-upload.directive';
+ import {ChangeDetectorRef, Component, inject, OnDestroy, OnInit, ViewChild} from '@angular/core';
+ 
+ import {FormsModule} from '@angular/forms';
+@@ -33,6 +34,7 @@ interface UploadingFile {
+     Select,
+     Button,
+     FileUpload,
++    Fb2ZipUploadDirective,
+     Badge,
+     Tooltip,
+     TranslocoDirective
+@@ -54,7 +56,7 @@ export class AdditionalFileUploaderComponent implements OnInit, OnDestroy {
+   fileType: AdditionalFileType = AdditionalFileType.ALTERNATIVE_FORMAT;
+   isUploading = false;
+   readonly AdditionalFileType = AdditionalFileType;
+-  private static readonly BOOK_FORMAT_ACCEPT = '.pdf,.epub,.cbz,.cbr,.cb7,.fb2,.mobi,.azw,.azw3,.m4b,.m4a,.mp3,.opus';
++  private static readonly BOOK_FORMAT_ACCEPT = '.pdf,.epub,.cbz,.cbr,.cb7,.fb2,.fb2.zip,.mobi,.azw,.azw3,.m4b,.m4a,.mp3,.opus';
+   maxFileSizeBytes?: number;
+   maxFileSizeDisplay: string = '100 MB';
+ 
+diff --git c/frontend/src/app/shared/components/book-uploader/book-uploader.component.html w/frontend/src/app/shared/components/book-uploader/book-uploader.component.html
+index e8ef638..ab8fc94 100644
+--- c/frontend/src/app/shared/components/book-uploader/book-uploader.component.html
++++ w/frontend/src/app/shared/components/book-uploader/book-uploader.component.html
+@@ -85,11 +85,11 @@
+             {{ t('selectFiles') }}
+           </span>
+         </div>
+-        <p-fileupload
++        <p-fileupload appFb2ZipUpload
+           name="file"
+           [customUpload]="true"
+           [multiple]="true"
+-          accept=".pdf,.epub,.cbz,.cbr,.cb7,.fb2,.mobi,.azw,.azw3,.m4b,.m4a,.mp3,.opus"
++          accept=".pdf,.epub,.cbz,.cbr,.cb7,.fb2,.fb2.zip,.mobi,.azw,.azw3,.m4b,.m4a,.mp3,.opus"
+           (onSelect)="onFilesSelect($event)"
+           (uploadHandler)="uploadFiles($event)">
+           <ng-template #header let-files let-chooseCallback="chooseCallback" let-clearCallback="clearCallback" let-uploadCallback="uploadCallback">
+diff --git c/frontend/src/app/shared/components/book-uploader/book-uploader.component.spec.ts w/frontend/src/app/shared/components/book-uploader/book-uploader.component.spec.ts
+index fc3a76b..50c9c67 100644
+--- c/frontend/src/app/shared/components/book-uploader/book-uploader.component.spec.ts
++++ w/frontend/src/app/shared/components/book-uploader/book-uploader.component.spec.ts
+@@ -1,4 +1,15 @@
+-import {describe, it} from 'vitest';
++import {beforeEach, describe, expect, it, vi} from 'vitest';
++import {signal} from '@angular/core';
++import {ComponentFixture, TestBed} from '@angular/core/testing';
++import {provideHttpClient} from '@angular/common/http';
++import {HttpTestingController, provideHttpClientTesting} from '@angular/common/http/testing';
++import {MessageService} from '@openng/optimus-ui/api';
++import {DynamicDialogRef} from '@openng/optimus-ui/dynamicdialog';
++import {BookUploaderComponent} from './book-uploader.component';
++import {LibraryService} from '../../../features/book/service/library.service';
++import {AppSettingsService} from '../../service/app-settings.service';
++import {getTranslocoModule} from '../../../core/testing/transloco-testing';
++
+ 
+ // NOTE(frontend-seam): Honest coverage for this component needs an Optimus UI FileUpload host seam,
+ // controllable library/settings signals, and a stable upload-progress harness for `HttpRequest`
+@@ -15,3 +26,71 @@ describe.skip('BookUploaderComponent', () => {
+     // driven without coupling the spec to the full Optimus UI/http runtime.
+   });
+ });
++
++describe('BookUploaderComponent FB2 ZIP uploads', () => {
++  let fixture: ComponentFixture<BookUploaderComponent>;
++  let http: HttpTestingController;
++
++  beforeEach(async () => {
++    await TestBed.configureTestingModule({
++      imports: [BookUploaderComponent, getTranslocoModule()],
++      providers: [
++        provideHttpClient(), provideHttpClientTesting(), MessageService,
++        {provide: DynamicDialogRef, useValue: {close: vi.fn()}},
++        {provide: LibraryService, useValue: {libraries: signal([
++          {id: 1, name: 'Books', watch: false, paths: [{id: 2, path: '/books'}]}
++        ])}},
++        {provide: AppSettingsService, useValue: {appSettings: signal({maxFileUploadSizeInMb: 100})}}
++      ]
++    }).compileComponents();
++    fixture = TestBed.createComponent(BookUploaderComponent);
++    http = TestBed.inject(HttpTestingController);
++    fixture.detectChanges();
++    await fixture.whenStable();
++  });
++
++  for (const destination of ['library', 'bookdrop']) {
++    for (const method of ['select', 'drop']) {
++      it(`uploads an uppercase FB2 ZIP to ${destination} after ${method}`, () => {
++        const component = fixture.componentInstance;
++        component.value = destination;
++        fixture.detectChanges();
++        const file = new File(['archive bytes'], 'Книга.FB2.ZIP', {type: 'application/zip'});
++        if (method === 'select') {
++          const input = fixture.nativeElement.querySelector('input[type=file]');
++          Object.defineProperty(input, 'files', {value: [file]});
++          input.dispatchEvent(new Event('change'));
++        } else {
++          const event = new Event('drop', {bubbles: true, cancelable: true});
++          Object.defineProperty(event, 'dataTransfer', {value: {files: [file]}});
++          component.fileUpload.content!.nativeElement.dispatchEvent(event);
++        }
++        expect(component.fileUpload.files).toEqual([file]);
++        expect(component.files[0].file).toBe(file);
++        expect(component.fileUpload.accept?.split(',')).toContain('.fb2.zip');
++        expect(component.fileUpload.accept?.split(',')).not.toContain('.zip');
++        component.fileUpload.upload();
++        const request = http.expectOne(req => req.url.endsWith(destination === 'library'
++          ? '/api/v1/files/upload' : '/api/v1/files/upload/bookdrop'));
++        expect(request.request.body.get('file').name).toBe(file.name);
++        expect(request.request.body.get('file').size).toBe(file.size);
++        // Leave the response pending to keep this check focused on the outgoing upload.
++        http.verify();
++      });
++    }
++  }
++
++  it('rejects unrelated ZIP files while preserving ordinary formats', () => {
++    const component = fixture.componentInstance;
++    const files = ['book.zip', 'book.fb2.zip.exe', 'book.fb2.zip', 'plain.fb2', 'plain.epub', 'plain.pdf']
++      .map(name => new File(['bytes'], name));
++    const input = fixture.nativeElement.querySelector('input[type=file]');
++    Object.defineProperty(input, 'files', {value: files});
++    input.dispatchEvent(new Event('change'));
++    expect(component.fileUpload.files.map(file => file.name))
++      .toEqual(['book.fb2.zip', 'plain.fb2', 'plain.epub', 'plain.pdf']);
++    expect(component.files).toHaveLength(4);
++    expect(component.fileUpload.msgs).toHaveLength(2);
++    http.expectNone(req => req.method === 'POST');
++  });
++});
+diff --git c/frontend/src/app/shared/components/book-uploader/book-uploader.component.ts w/frontend/src/app/shared/components/book-uploader/book-uploader.component.ts
+index 8649b72..1979e00 100644
+--- c/frontend/src/app/shared/components/book-uploader/book-uploader.component.ts
++++ w/frontend/src/app/shared/components/book-uploader/book-uploader.component.ts
+@@ -1,3 +1,4 @@
++import {Fb2ZipUploadDirective} from '../../directives/fb2-zip-upload.directive';
+ import {ChangeDetectorRef, Component, inject, ViewChild, effect, signal} from '@angular/core';
+ import {FileSelectEvent, FileUpload, FileUploadHandlerEvent} from '@openng/optimus-ui/fileupload';
+ import {Button} from '@openng/optimus-ui/button';
+@@ -31,6 +32,7 @@ type FileRemoveCallback = (event: Event, index: number) => void;
+   standalone: true,
+   imports: [
+     FileUpload,
++    Fb2ZipUploadDirective,
+     Button,
+     FormsModule,
+     Select,
+diff --git 1/frontend/src/app/shared/directives/fb2-zip-upload.directive.ts 2/frontend/src/app/shared/directives/fb2-zip-upload.directive.ts
+new file mode 100644
+index 0000000..509843f
+--- /dev/null
++++ 2/frontend/src/app/shared/directives/fb2-zip-upload.directive.ts
+@@ -0,0 +1,17 @@
++import {Directive, inject} from '@angular/core';
++import {FileUpload} from '@openng/optimus-ui/fileupload';
++
++@Directive({
++  selector: 'p-fileupload[appFb2ZipUpload]',
++  standalone: true
++})
++export class Fb2ZipUploadDirective {
++  constructor() {
++    const upload = inject(FileUpload, {self: true});
++    const getFileExtension = upload.getFileExtension.bind(upload);
++    // Optimus UI checks only the last suffix, so its accept filter needs this compound extension.
++    upload.getFileExtension = (file: File) => file.name.toLowerCase().endsWith('.fb2.zip')
++      ? '.fb2.zip'
++      : getFileExtension(file);
++  }
++}

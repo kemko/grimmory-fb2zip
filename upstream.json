@@ -1,0 +1,7 @@
+{
+  "repository": "https://github.com/grimmory-tools/grimmory.git",
+  "base_tag": "v3.5.0",
+  "base_sha": "402e89b4452f8e2b17ab95f16c1621c003516cd2",
+  "minimum_tag": "v3.5.0",
+  "patch_revision": 1
+}

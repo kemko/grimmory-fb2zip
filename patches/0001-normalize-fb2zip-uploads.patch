@@ -1,0 +1,712 @@
+diff --git c/backend/src/main/java/org/booklore/service/upload/Fb2ZipUploadExtractor.java i/backend/src/main/java/org/booklore/service/upload/Fb2ZipUploadExtractor.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..10b4448b991e7a7c5f0ab8cae63a3ed7903c6722
+--- /dev/null
++++ i/backend/src/main/java/org/booklore/service/upload/Fb2ZipUploadExtractor.java
+@@ -0,0 +1,96 @@
++package org.booklore.service.upload;
++
++import org.booklore.exception.ApiError;
++import org.booklore.util.SecureXmlUtils;
++
++import java.io.IOException;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.util.Locale;
++import java.util.zip.CRC32;
++import java.util.zip.ZipFile;
++import java.util.zip.ZipException;
++
++final class Fb2ZipUploadExtractor {
++    private static final int MAX_ENTRIES = 1024;
++
++    private Fb2ZipUploadExtractor() {}
++
++    static boolean accepts(String name) {
++        return name.toLowerCase(Locale.ROOT).endsWith(".fb2.zip");
++    }
++
++    static String bookName(String name) {
++        return accepts(name) ? name.substring(0, name.length() - 8) + ".fb2" : name;
++    }
++
++    static Path extract(Path archive, int maxSizeMb) throws IOException {
++        Path output = Files.createTempFile("upload-", ".fb2");
++        boolean complete = false;
++        try {
++            try (ZipFile zip = new ZipFile(archive.toFile())) {
++                // ZipFile requires a central directory; ZipInputStream alone accepts truncated archives.
++                var entries = zip.entries();
++                int count = 0;
++                boolean foundBook = false;
++                long bytes = 0;
++                byte[] buffer = new byte[8192];
++                while (entries.hasMoreElements()) {
++                    var entry = entries.nextElement();
++                    String name = entry.getName().replace('\\', '/');
++                    if (++count > MAX_ENTRIES || name.startsWith("/") || name.matches("^[A-Za-z]:.*")
++                            || java.util.Arrays.asList(name.split("/")).contains("..")) {
++                        throw ApiError.INVALID_FILE_FORMAT.createException("Unsafe ZIP entry or too many entries");
++                    }
++                    if (!entry.isDirectory()) {
++                        if (foundBook || !name.toLowerCase(Locale.ROOT).endsWith(".fb2")) {
++                            throw ApiError.INVALID_FILE_FORMAT.createException("Archive must contain exactly one FB2 file");
++                        }
++                        foundBook = true;
++                    }
++                    CRC32 crc = new CRC32();
++                    try (var input = zip.getInputStream(entry);
++                         var target = entry.isDirectory() ? java.io.OutputStream.nullOutputStream() : Files.newOutputStream(output)) {
++                        int read;
++                        while ((read = input.read(buffer)) != -1) {
++                            bytes += read;
++                            if (bytes > maxSizeMb * 1024L * 1024L) {
++                                throw ApiError.FILE_TOO_LARGE.createException(maxSizeMb);
++                            }
++                            if (entry.isDirectory() && read > 0) {
++                                throw ApiError.INVALID_FILE_FORMAT.createException("ZIP directory contains file data");
++                            }
++                            crc.update(buffer, 0, read);
++                            target.write(buffer, 0, read);
++                        }
++                    }
++                    // ZipFile streams do not check CRC automatically. Include directory data in all limits.
++                    if (crc.getValue() != entry.getCrc()) {
++                        throw ApiError.INVALID_FILE_FORMAT.createException("Invalid ZIP CRC");
++                    }
++                }
++                if (!foundBook) {
++                    throw ApiError.INVALID_FILE_FORMAT.createException("Archive must contain exactly one FB2 file");
++                }
++                try {
++                    var document = SecureXmlUtils.createSecureDocumentBuilder(true).parse(output.toFile());
++                    if (document.getDoctype() != null || !"FictionBook".equals(document.getDocumentElement().getLocalName())) {
++                        throw ApiError.INVALID_FILE_FORMAT.createException("Archive does not contain valid FB2 XML");
++                    }
++                } catch (org.xml.sax.SAXException e) {
++                    throw ApiError.INVALID_FILE_FORMAT.createException("Archive does not contain valid FB2 XML");
++                } catch (javax.xml.parsers.ParserConfigurationException e) {
++                    throw new IOException("Cannot configure FB2 XML parser", e);
++                }
++            } catch (ZipException e) {
++                throw ApiError.INVALID_FILE_FORMAT.createException("Invalid FB2 ZIP archive: " + e.getMessage());
++            }
++            complete = true;
++            return output;
++        } finally {
++            if (!complete) {
++                Files.deleteIfExists(output);
++            }
++        }
++    }
++}
+diff --git c/backend/src/main/java/org/booklore/service/upload/FileUploadService.java i/backend/src/main/java/org/booklore/service/upload/FileUploadService.java
+index 31db374bc143486eb4cfda13e572f1a27cbbbf0f..d46176d6d8a1e652931964e85d03aff2fe415964 100644
+--- c/backend/src/main/java/org/booklore/service/upload/FileUploadService.java
++++ i/backend/src/main/java/org/booklore/service/upload/FileUploadService.java
+@@ -28,6 +28,8 @@ import org.springframework.util.StringUtils;
+ import lombok.extern.slf4j.Slf4j;
+ import org.springframework.stereotype.Service;
+ import org.springframework.transaction.annotation.Transactional;
++import org.springframework.transaction.support.TransactionSynchronization;
++import org.springframework.transaction.support.TransactionSynchronizationManager;
+ import org.springframework.web.multipart.MultipartFile;
+ 
+ import java.io.File;
+@@ -39,6 +41,9 @@ import java.util.Optional;
+ import org.booklore.model.enums.AuditAction;
+ import org.booklore.service.audit.AuditService;
+ import java.nio.file.Paths;
++import java.nio.file.LinkOption;
++import java.nio.file.attribute.BasicFileAttributes;
++import java.util.Objects;
+ 
+ @RequiredArgsConstructor
+ @Service
+@@ -68,14 +73,12 @@ public class FileUploadService {
+         final LibraryEntity libraryEntity = findLibraryById(libraryId);
+         final LibraryPathEntity libraryPathEntity = findLibraryPathById(libraryEntity, pathId);
+         final Path libraryRoot = FileUtils.normalizeAbsolutePath(Path.of(libraryPathEntity.getPath()));
+-        final String originalFileName = getValidatedFileName(file);
++        final String originalFileName = Fb2ZipUploadExtractor.bookName(getValidatedFileName(file));
+         final BookFileExtension fileExtension = getFileExtension(originalFileName);
+         validateAllowedFormat(libraryEntity, fileExtension.getType());
+ 
+-        Path tempPath = null;
+-        try {
+-            tempPath = createTempFile(UPLOAD_TEMP_PREFIX, originalFileName);
+-            file.transferTo(tempPath);
++        try (PreparedUpload upload = prepareUpload(file, UPLOAD_TEMP_PREFIX, true)) {
++            final Path tempPath = upload.path;
+             final BookMetadata metadata = extractMetadata(fileExtension, tempPath.toFile(), originalFileName);
+             final String uploadPattern = fileMovingHelper.getFileNamingPattern(libraryEntity);
+ 
+@@ -83,16 +86,15 @@ public class FileUploadService {
+             final Path finalPath = resolvePathWithinRoot(libraryRoot, relativePath);
+ 
+             validateFinalPath(finalPath, libraryRoot);
+-            moveFileToFinalLocation(tempPath, finalPath, libraryRoot);
++            upload.moveTo(finalPath, libraryRoot);
+ 
+             log.info("File uploaded to final location: {}", finalPath);
+             auditService.log(AuditAction.BOOK_UPLOADED, "Library", libraryId, "Uploaded file: " + originalFileName);
++            upload.complete = true;
+ 
+         } catch (IOException e) {
+             log.error("Failed to upload file: {}", originalFileName, e);
+             throw ApiError.FILE_READ_ERROR.createException(e.getMessage());
+-        } finally {
+-            cleanupTempFile(tempPath);
+         }
+     }
+ 
+@@ -101,17 +103,23 @@ public class FileUploadService {
+         final BookEntity book = findBookById(bookId);
+         final String originalFileName = getValidatedFileName(file);
+         final Long libraryId = book.getLibrary() != null ? book.getLibrary().getId() : null;
+-        final String sanitizedFileName = PathPatternResolver.truncateFilenameWithExtension(originalFileName);
+         final boolean wasPhysicalBook = Boolean.TRUE.equals(book.getIsPhysical());
++        final boolean bookUpload = isBook || wasPhysicalBook || book.getPrimaryBookFile() == null;
++        final String sanitizedFileName = PathPatternResolver.truncateFilenameWithExtension(
++                bookUpload ? Fb2ZipUploadExtractor.bookName(originalFileName) : originalFileName);
++        if (bookUpload && Fb2ZipUploadExtractor.accepts(originalFileName)) {
++            validateFile(file);
++            if (book.getLibrary() != null) {
++                validateAllowedFormat(book.getLibrary(), BookFileType.FB2);
++            }
++        }
+ 
+-        Path tempPath = null;
+         boolean monitoringUnregistered = false;
+-        try {
+-            tempPath = createTempFile(UPLOAD_TEMP_PREFIX, sanitizedFileName);
+-            file.transferTo(tempPath);
+-
++        try (PreparedUpload upload = prepareUpload(file, UPLOAD_TEMP_PREFIX, bookUpload)) {
++            final Path tempPath = upload.path;
++            final long fileSize = Files.size(tempPath);
+             final String fileHash = FileFingerprint.generateHash(tempPath);
+-            if (isBook) {
++            if (isBook || upload.normalized) {
+                 validateAlternativeFormatDuplicate(fileHash);
+             }
+ 
+@@ -166,14 +174,16 @@ public class FileUploadService {
+                 monitoringRegistrationService.unregisterLibrary(libraryId);
+                 monitoringUnregistered = true;
+             }
+-            moveFileToFinalLocation(tempPath, finalPath, finalRootPath);
++            upload.moveTo(finalPath, finalRootPath);
+ 
+             log.info("Additional file uploaded to final location: {}", finalPath);
+ 
+-            final BookFileEntity entity = createAdditionalFileEntityWithSubPath(book, finalFileName, fileSubPath, isBook, effectiveBookType, file.getSize(), fileHash, description);
++            final BookFileEntity entity = createAdditionalFileEntityWithSubPath(book, finalFileName, fileSubPath, isBook || upload.normalized, effectiveBookType, fileSize, fileHash, description);
+             final BookFileEntity savedEntity = additionalFileRepository.save(entity);
+ 
+-            return additionalFileMapper.toAdditionalFile(savedEntity);
++            BookFile result = additionalFileMapper.toAdditionalFile(savedEntity);
++            upload.complete = true;
++            return result;
+ 
+         } catch (IOException e) {
+             log.error("Failed to upload additional file for book {}: {}", bookId, sanitizedFileName, e);
+@@ -192,7 +202,6 @@ public class FileUploadService {
+                     log.warn("Failed to re-register library {} for monitoring after additional file upload: {}", libraryId, e.getMessage());
+                 }
+             }
+-            cleanupTempFile(tempPath);
+         }
+     }
+ 
+@@ -225,23 +234,105 @@ public class FileUploadService {
+         final Path dropFolder = FileUtils.normalizeAbsolutePath(Path.of(appProperties.getBookdropFolder()));
+         Files.createDirectories(dropFolder);
+ 
+-        final String originalFilename = getValidatedFileName(file);
++        final String originalFilename = Fb2ZipUploadExtractor.bookName(getValidatedFileName(file));
+         final String sanitizedFilename = PathPatternResolver.truncateFilenameWithExtension(originalFilename);
+-        Path tempPath = null;
+ 
+-        try {
+-            tempPath = createTempFile(BOOKDROP_TEMP_PREFIX, sanitizedFilename);
+-            file.transferTo(tempPath);
++        try (PreparedUpload upload = prepareUpload(file, BOOKDROP_TEMP_PREFIX, true)) {
+ 
+             final Path finalPath = resolvePathWithinRoot(dropFolder, sanitizedFilename);
+             validateFinalPath(finalPath, dropFolder);
+-            moveFileToFinalLocation(tempPath, finalPath, dropFolder);
++            upload.moveTo(finalPath, dropFolder);
++            upload.complete = true;
+ 
+             log.info("File moved to book-drop folder: {}", finalPath);
+             return null;
+ 
+-        } finally {
+-            cleanupTempFile(tempPath);
++        }
++    }
++
++    private PreparedUpload prepareUpload(MultipartFile file, String prefix, boolean bookUpload) throws IOException {
++        String name = getValidatedFileName(file);
++        Path source = createTempFile(prefix, name);
++        boolean normalized = bookUpload && Fb2ZipUploadExtractor.accepts(name);
++        try {
++            file.transferTo(source);
++            if (normalized) {
++                int limit = appSettingService.getAppSettings().getMaxFileUploadSizeInMb();
++                if (Files.size(source) > limit * MB_TO_BYTES_MULTIPLIER) {
++                    throw ApiError.FILE_TOO_LARGE.createException(limit);
++                }
++                Path extracted = Fb2ZipUploadExtractor.extract(source, limit);
++                cleanupTempFile(source);
++                source = extracted;
++            }
++            return new PreparedUpload(source, normalized);
++        } catch (IOException | RuntimeException e) {
++            cleanupTempFile(source);
++            throw e;
++        }
++    }
++
++    private final class PreparedUpload implements AutoCloseable {
++        private final Path path;
++        private final boolean normalized;
++        private Path movedPath;
++        private BasicFileAttributes movedAttributes;
++        private boolean complete;
++
++        private PreparedUpload(Path path, boolean normalized) {
++            this.path = path;
++            this.normalized = normalized;
++        }
++
++        private void moveTo(Path target, Path root) throws IOException {
++            if (!normalized) {
++                moveFileToFinalLocation(path, target, root);
++                return;
++            }
++            movedAttributes = Files.readAttributes(path, BasicFileAttributes.class,
++                    LinkOption.NOFOLLOW_LINKS);
++            moveFileToFinalLocation(path, target, root);
++            movedPath = target;
++            movedAttributes = Files.readAttributes(target, BasicFileAttributes.class,
++                    LinkOption.NOFOLLOW_LINKS);
++            if (TransactionSynchronizationManager.isSynchronizationActive()) {
++                TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
++                    @Override
++                    public void afterCompletion(int status) {
++                        if (status != STATUS_COMMITTED) {
++                            cleanupMovedFile();
++                        }
++                    }
++                });
++            }
++        }
++
++        private void cleanupMovedFile() {
++            if (movedPath != null) {
++                try {
++                    if (Files.exists(movedPath, LinkOption.NOFOLLOW_LINKS) && movedAttributes != null) {
++                        var current = Files.readAttributes(movedPath, BasicFileAttributes.class,
++                                LinkOption.NOFOLLOW_LINKS);
++                        if (Objects.equals(movedAttributes.fileKey(), current.fileKey())
++                                && movedAttributes.creationTime().equals(current.creationTime())
++                                && movedAttributes.lastModifiedTime().equals(current.lastModifiedTime())
++                                && movedAttributes.size() == current.size()) {
++                            Files.delete(movedPath);
++                        }
++                    }
++                    movedPath = null;
++                } catch (IOException e) {
++                    log.warn("Failed to clean up rolled-back FB2 upload: {}", movedPath, e);
++                }
++            }
++        }
++
++        @Override
++        public void close() {
++            cleanupTempFile(path);
++            if (!complete) {
++                cleanupMovedFile();
++            }
+         }
+     }
+ 
+@@ -421,7 +512,7 @@ public class FileUploadService {
+ 
+     private void validateFile(MultipartFile file) {
+         final String originalFilename = file.getOriginalFilename();
+-        if (originalFilename == null || BookFileExtension.fromFileName(originalFilename).isEmpty()) {
++        if (originalFilename == null || BookFileExtension.fromFileName(Fb2ZipUploadExtractor.bookName(originalFilename)).isEmpty()) {
+             throw ApiError.INVALID_FILE_FORMAT.createException("Unsupported file extension");
+         }
+ 
+diff --git c/backend/src/test/java/org/booklore/service/upload/Fb2ZipUploadExtractorTest.java i/backend/src/test/java/org/booklore/service/upload/Fb2ZipUploadExtractorTest.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..0c28637896a653d91ff6f7913363f9c75fc15e72
+--- /dev/null
++++ i/backend/src/test/java/org/booklore/service/upload/Fb2ZipUploadExtractorTest.java
+@@ -0,0 +1,175 @@
++package org.booklore.service.upload;
++
++import org.booklore.exception.APIException;
++import org.booklore.exception.ApiError;
++import org.booklore.service.metadata.extractor.Fb2MetadataExtractor;
++import org.booklore.service.file.FileFingerprint;
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.api.io.TempDir;
++import org.junit.jupiter.params.ParameterizedTest;
++import org.junit.jupiter.params.provider.ValueSource;
++
++import java.io.ByteArrayOutputStream;
++import java.io.IOException;
++import java.nio.charset.Charset;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.util.Arrays;
++import java.util.LinkedHashMap;
++import java.util.Map;
++import java.util.Set;
++import java.util.stream.Collectors;
++import java.util.zip.ZipEntry;
++import java.util.zip.ZipOutputStream;
++
++import static org.assertj.core.api.Assertions.*;
++
++class Fb2ZipUploadExtractorTest {
++    @TempDir Path tempDir;
++    static final byte[] FB2 = ("<FictionBook xmlns=\"http://www.gribuser.ru/xml/fictionbook/2.0\">"
++            + "<description><title-info><book-title>Книга</book-title></title-info></description>"
++            + "<binary id=\"cover.png\" content-type=\"image/png\">AQIDBA==</binary>"
++            + "<body><section><p>" + "Текст ".repeat(300) + "</p></section></body></FictionBook>").getBytes(StandardCharsets.UTF_8);
++
++    static byte[] zip(Map<String, byte[]> entries) throws IOException {
++        var bytes = new ByteArrayOutputStream();
++        try (var zip = new ZipOutputStream(bytes)) {
++            for (var entry : entries.entrySet()) {
++                zip.putNextEntry(new ZipEntry(entry.getKey()));
++                zip.write(entry.getValue());
++                zip.closeEntry();
++            }
++        }
++        return bytes.toByteArray();
++    }
++
++    static Set<Path> uploadTemps() throws IOException {
++        try (var paths = Files.list(Path.of(System.getProperty("java.io.tmpdir")))) {
++            return paths.filter(path -> path.getFileName().toString().startsWith("upload-")
++                    || path.getFileName().toString().startsWith("bookdrop-")).collect(Collectors.toSet());
++        }
++    }
++
++    private Path archive(byte[] bytes) throws IOException {
++        return Files.write(tempDir.resolve("book.fb2.zip"), bytes);
++    }
++
++    private void rejects(byte[] bytes) throws IOException {
++        Set<Path> before = uploadTemps();
++        assertThatThrownBy(() -> Fb2ZipUploadExtractor.extract(archive(bytes), 1)).isInstanceOf(APIException.class);
++        assertThat(uploadTemps()).isEqualTo(before);
++    }
++
++    @Test
++    void preservesBytesMetadataCoverAndHashForNestedUppercaseFb2() throws Exception {
++        Path plain = Files.write(tempDir.resolve("plain.fb2"), FB2);
++        Path result = Fb2ZipUploadExtractor.extract(archive(zip(Map.of("nested/", new byte[0], "nested/Книга.FB2", FB2))), 1);
++        try {
++            assertThat(Files.readAllBytes(result)).isEqualTo(FB2);
++            var extractor = new Fb2MetadataExtractor();
++            assertThat(extractor.extractMetadata(result.toFile())).usingRecursiveComparison().isEqualTo(extractor.extractMetadata(plain.toFile()));
++            assertThat(extractor.extractMetadata(result.toFile()).getTitle()).isEqualTo("Книга");
++            assertThat(extractor.extractCover(result.toFile())).containsExactly(1, 2, 3, 4);
++            assertThat(FileFingerprint.generateHash(result)).isEqualTo(FileFingerprint.generateHash(plain));
++        } finally {
++            Files.delete(result);
++        }
++    }
++
++    @Test
++    void preservesWindows1251() throws Exception {
++        byte[] data = ("<?xml version=\"1.0\" encoding=\"windows-1251\"?><FictionBook><body>Книга</body></FictionBook>").getBytes(Charset.forName("windows-1251"));
++        Path result = Fb2ZipUploadExtractor.extract(archive(zip(Map.of("book.fb2", data))), 1);
++        try {
++            assertThat(Files.readAllBytes(result)).isEqualTo(data);
++        } finally {
++            Files.delete(result);
++        }
++    }
++
++    @ParameterizedTest
++    @ValueSource(strings = {"../book.fb2", "dir/../book.fb2", "/book.fb2", "C:/book.fb2", "..\\book.fb2", "readme.txt"})
++    void rejectsUnsafeAndForeignEntries(String name) throws Exception {
++        rejects(zip(Map.of(name, FB2)));
++    }
++
++    @Test
++    void rejectsEmptyMultipleAndMixedArchives() throws Exception {
++        rejects(zip(Map.of()));
++        rejects(zip(Map.of("dir/", new byte[0])));
++        rejects(zip(Map.of("one.fb2", FB2, "two.fb2", FB2)));
++        rejects(zip(Map.of("one.fb2", FB2, "readme.txt", new byte[0])));
++    }
++
++    @ParameterizedTest
++    @ValueSource(strings = {"", "not xml", "<FictionBook>", "<html/>", "<!DOCTYPE FictionBook [<!ENTITY xxe SYSTEM 'file:///etc/passwd'>]><FictionBook>&xxe;</FictionBook>"})
++    void rejectsInvalidXmlAndDoctype(String xml) throws Exception {
++        rejects(zip(Map.of("book.fb2", xml.getBytes(StandardCharsets.UTF_8))));
++    }
++
++    @Test
++    void rejectsInvalidTruncatedEncryptedAndBadCrcArchives() throws Exception {
++        rejects(new byte[0]);
++        rejects("not a zip".getBytes(StandardCharsets.UTF_8));
++        byte[] valid = zip(Map.of("book.fb2", FB2));
++        rejects(Arrays.copyOf(valid, valid.length - 22));
++        int central = -1;
++        for (int i = 0; i < valid.length - 4; i++) {
++            if (valid[i] == 0x50 && valid[i + 1] == 0x4b && valid[i + 2] == 1 && valid[i + 3] == 2) {
++                central = i;
++                break;
++            }
++        }
++        assertThat(central).isPositive();
++        byte[] corrupt = valid.clone();
++        corrupt[central + 16] ^= 1;
++        rejects(corrupt);
++        byte[] encrypted = valid.clone();
++        encrypted[central + 8] |= 1;
++        encrypted[6] |= 1;
++        rejects(encrypted);
++    }
++
++    @Test
++    void boundsActualInflatedBytesWithValidFb2() throws Exception {
++        int limit = 1024 * 1024;
++        String opening = "<FictionBook><body><section><p>";
++        String closing = "</p></section></body></FictionBook>";
++        byte[] atLimit = (opening + "a".repeat(limit - opening.length() - closing.length()) + closing)
++                .getBytes(StandardCharsets.UTF_8);
++        Path result = Fb2ZipUploadExtractor.extract(archive(zip(Map.of("book.fb2", atLimit))), 1);
++        try {
++            assertThat(Files.readAllBytes(result)).isEqualTo(atLimit);
++        } finally {
++            Files.delete(result);
++        }
++        byte[] overLimit = (opening + "a".repeat(limit + 1 - opening.length() - closing.length()) + closing)
++                .getBytes(StandardCharsets.UTF_8);
++        Set<Path> before = uploadTemps();
++        Path oversized = archive(zip(Map.of("book.fb2", overLimit)));
++        APIException expected = ApiError.FILE_TOO_LARGE.createException(1);
++        assertThatThrownBy(() -> Fb2ZipUploadExtractor.extract(oversized, 1))
++                .isInstanceOf(APIException.class).hasMessage(expected.getMessage())
++                .extracting(error -> ((APIException) error).getStatus()).isEqualTo(expected.getStatus());
++        assertThat(uploadTemps()).isEqualTo(before);
++    }
++
++    @Test
++    void rejectsDirectoryPayloadAlongsideValidFb2() throws Exception {
++        Set<Path> before = uploadTemps();
++        Path malformed = archive(zip(Map.of("book.fb2", FB2, "directory/", new byte[]{1})));
++        assertThatThrownBy(() -> Fb2ZipUploadExtractor.extract(malformed, 1))
++                .isInstanceOf(APIException.class)
++                .hasMessage(ApiError.INVALID_FILE_FORMAT.createException("ZIP directory contains file data").getMessage());
++        assertThat(uploadTemps()).isEqualTo(before);
++    }
++
++    @Test
++    void rejectsTooManyEntries() throws Exception {
++        Map<String, byte[]> entries = new LinkedHashMap<>();
++        for (int i = 0; i < 1024; i++) entries.put(i + "/", new byte[0]);
++        entries.put("book.fb2", FB2);
++        rejects(zip(entries));
++    }
++}
+diff --git c/backend/src/test/java/org/booklore/service/upload/FileUploadServiceTest.java i/backend/src/test/java/org/booklore/service/upload/FileUploadServiceTest.java
+index e7318767a76861e5500a9b9d86808df789d67c00..98d49a0d5a73e826d745a4c3385b94532b576c85 100644
+--- c/backend/src/test/java/org/booklore/service/upload/FileUploadServiceTest.java
++++ i/backend/src/test/java/org/booklore/service/upload/FileUploadServiceTest.java
+@@ -27,6 +27,11 @@ import org.junit.jupiter.api.DisplayName;
+ import org.junit.jupiter.api.Test;
+ import org.junit.jupiter.api.io.TempDir;
+ import org.mockito.Mock;
++import org.mockito.ArgumentCaptor;
++import org.springframework.transaction.support.TransactionSynchronization;
++import org.springframework.transaction.support.TransactionSynchronizationManager;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++import static org.booklore.service.upload.Fb2ZipUploadExtractorTest.*;
+ import org.mockito.MockedStatic;
+ import org.mockito.MockitoAnnotations;
+ import org.springframework.mock.web.MockMultipartFile;
+@@ -376,4 +381,170 @@ class FileUploadServiceTest {
+              assertThat(savedName).endsWith(".pdf");
+         }
+     }
++    private MockMultipartFile zippedBook(String name) throws IOException {
++        return new MockMultipartFile("file", name, "application/zip", zip(Map.of("different.fb2", FB2)));
++    }
++
++    private LibraryEntity fb2Library() {
++        LibraryEntity library = new LibraryEntity();
++        library.setId(1L);
++        library.setName("Library");
++        LibraryPathEntity path = new LibraryPathEntity();
++        path.setId(1L);
++        path.setPath(tempDir.toString());
++        library.setLibraryPaths(List.of(path));
++        when(libraryRepository.findById(1L)).thenReturn(Optional.of(library));
++        when(fileMovingHelper.getFileNamingPattern(library)).thenReturn("{currentFilename}");
++        when(metadataExtractorFactory.extractMetadata(eq(BookFileExtension.FB2), any(File.class)))
++                .thenReturn(BookMetadata.builder().title("Книга").build());
++        return library;
++    }
++
++    private BookEntity fb2Book(boolean physical) {
++        LibraryEntity library = fb2Library();
++        BookEntity book = new BookEntity();
++        book.setId(1L);
++        book.setLibrary(library);
++        book.setLibraryPath(library.getLibraryPaths().getFirst());
++        book.setMetadata(new org.booklore.model.entity.BookMetadataEntity());
++        book.setIsPhysical(physical);
++        if (!physical) {
++            BookFileEntity primary = new BookFileEntity();
++            primary.setBook(book);
++            primary.setFileName("primary.epub");
++            primary.setBookType(BookFileType.EPUB);
++            primary.setFileSubPath("");
++            book.setBookFiles(Set.of(primary));
++        }
++        when(bookRepository.findByIdWithBookFiles(1L)).thenReturn(Optional.of(book));
++        doAnswer(call -> call.getArgument(0)).when(bookAdditionalFileRepository).save(any());
++        return book;
++    }
++
++    @Test
++    void fb2ZipLibraryAndBookDropUseExternalNameAndCleanTemps() throws Exception {
++        fb2Library();
++        Set<Path> before = uploadTemps();
++        service.uploadFile(zippedBook("Книга.FB2.ZIP"), 1L, 1L);
++        assertThat(Files.readAllBytes(tempDir.resolve("Книга.fb2"))).isEqualTo(FB2);
++        service.uploadFileBookDrop(zippedBook("другая.fb2.zip"));
++        assertThat(Files.readAllBytes(tempDir.resolve("другая.fb2"))).isEqualTo(FB2);
++        assertThat(uploadTemps()).isEqualTo(before);
++    }
++
++    @Test
++    void fb2ZipAdditionalAndPhysicalBookSaveInflatedHashAndSize() throws Exception {
++        for (boolean physical : new boolean[]{false, true}) {
++            fb2Book(physical);
++            String name = physical ? "physical" : "alternative";
++            service.uploadAdditionalFile(1L, zippedBook(name + ".fb2.zip"), !physical, null, "desc");
++            ArgumentCaptor<BookFileEntity> entity = ArgumentCaptor.forClass(BookFileEntity.class);
++            verify(bookAdditionalFileRepository, atLeastOnce()).save(entity.capture());
++            BookFileEntity saved = entity.getValue();
++            assertThat(saved.getFileName()).isEqualTo(name + ".fb2");
++            assertThat(saved.getBookType()).isEqualTo(BookFileType.FB2);
++            assertThat(saved.isBookFormat()).isTrue();
++            assertThat(saved.getFileSizeKb()).isEqualTo(FB2.length / 1024L);
++            assertThat(saved.getCurrentHash()).isEqualTo(FileFingerprint.generateHash(tempDir.resolve(name + ".fb2")));
++            assertThat(Files.readAllBytes(tempDir.resolve(name + ".fb2"))).isEqualTo(FB2);
++        }
++    }
++
++    @Test
++    void fb2ZipAttachmentKeepsArchiveBytes() throws Exception {
++        fb2Book(false);
++        MockMultipartFile file = zippedBook("attachment.fb2.zip");
++        service.uploadAdditionalFile(1L, file, false, null, "attachment");
++        assertThat(Files.readAllBytes(tempDir.resolve("attachment.fb2.zip"))).isEqualTo(file.getBytes());
++    }
++
++    @Test
++    void fb2ZipHonorsAllowedFormatsSizeAndInflatedDuplicates() throws Exception {
++        LibraryEntity library = fb2Library();
++        library.setAllowedFormats(List.of(BookFileType.EPUB));
++        assertThatThrownBy(() -> service.uploadFile(zippedBook("book.fb2.zip"), 1L, 1L)).isInstanceOf(APIException.class);
++        fb2Book(false).getLibrary().setAllowedFormats(List.of(BookFileType.EPUB));
++        assertThatThrownBy(() -> service.uploadAdditionalFile(1L, zippedBook("book.fb2.zip"), true, null, null)).isInstanceOf(APIException.class);
++        fb2Book(false);
++        Path plain = Files.write(tempDir.resolve("original.fb2"), FB2);
++        when(bookAdditionalFileRepository.findByAltFormatCurrentHash(FileFingerprint.generateHash(plain))).thenReturn(Optional.of(new BookFileEntity()));
++        assertThatThrownBy(() -> service.uploadAdditionalFile(1L, zippedBook("book.fb2.zip"), true, null, null)).isInstanceOf(IllegalArgumentException.class);
++        assertThat(tempDir.resolve("book.fb2")).doesNotExist();
++        appSettingService.getAppSettings().setMaxFileUploadSizeInMb(0);
++        assertThatThrownBy(() -> service.uploadAdditionalFile(1L, zippedBook("book.fb2.zip"), true, null, null)).isInstanceOf(APIException.class);
++    }
++
++    @Test
++    void fb2ZipFailureAndCollisionLeaveNoFilesOrTemps() throws Exception {
++        fb2Book(false);
++        Set<Path> before = uploadTemps();
++        MockMultipartFile invalid = new MockMultipartFile("file", "book.fb2.zip", "application/zip", new byte[]{1});
++        assertThatExceptionOfType(APIException.class).isThrownBy(() -> service.uploadFile(invalid, 1L, 1L))
++                .satisfies(error -> assertThat(error.getStatus()).isEqualTo(ApiError.INVALID_FILE_FORMAT.getStatus()));
++        assertThatExceptionOfType(APIException.class).isThrownBy(() -> service.uploadAdditionalFile(1L, invalid, true, null, null))
++                .satisfies(error -> assertThat(error.getStatus()).isEqualTo(ApiError.INVALID_FILE_FORMAT.getStatus()));
++        assertThatExceptionOfType(APIException.class).isThrownBy(() -> service.uploadFileBookDrop(invalid))
++                .satisfies(error -> assertThat(error.getStatus()).isEqualTo(ApiError.INVALID_FILE_FORMAT.getStatus()));
++        Files.writeString(tempDir.resolve("book.fb2"), "existing");
++        assertThatThrownBy(() -> service.uploadFileBookDrop(zippedBook("book.fb2.zip"))).isInstanceOf(APIException.class);
++        assertThat(Files.readString(tempDir.resolve("book.fb2"))).isEqualTo("existing");
++        assertThat(uploadTemps()).isEqualTo(before);
++        verify(bookAdditionalFileRepository, never()).save(any());
++    }
++
++    @Test
++    void fb2ZipSaveFailureAndTransactionRollbackRemoveOnlyNewFile() throws Exception {
++        fb2Book(false);
++        Set<Path> before = uploadTemps();
++        when(bookAdditionalFileRepository.save(any())).thenThrow(new IllegalStateException("database failed"));
++        assertThatThrownBy(() -> service.uploadAdditionalFile(1L, zippedBook("failed.fb2.zip"), true, null, null)).isInstanceOf(IllegalStateException.class);
++        assertThat(tempDir.resolve("failed.fb2")).doesNotExist();
++        doAnswer(call -> call.getArgument(0)).when(bookAdditionalFileRepository).save(any());
++        TransactionSynchronizationManager.initSynchronization();
++        try {
++            service.uploadAdditionalFile(1L, zippedBook("rollback.fb2.zip"), true, null, null);
++            assertThat(tempDir.resolve("rollback.fb2")).exists();
++            for (var callback : TransactionSynchronizationManager.getSynchronizations()) {
++                callback.afterCompletion(TransactionSynchronization.STATUS_ROLLED_BACK);
++            }
++            assertThat(tempDir.resolve("rollback.fb2")).doesNotExist();
++        } finally {
++            TransactionSynchronizationManager.clearSynchronization();
++        }
++        assertThat(uploadTemps()).isEqualTo(before);
++    }
++
++    @Test
++    void fb2ZipConcurrentCollisionDuringMovePreservesExistingFile() throws Exception {
++        fb2Book(false);
++        // This callback runs after validateFinalPath, immediately before the final copy.
++        doAnswer(call -> {
++            Files.writeString(tempDir.resolve("book.fb2"), "concurrent upload");
++            return null;
++        }).when(monitoringRegistrationService).unregisterLibrary(1L);
++        Set<Path> before = uploadTemps();
++        assertThatThrownBy(() -> service.uploadAdditionalFile(1L, zippedBook("book.fb2.zip"), true, null, null)).isInstanceOf(APIException.class);
++        assertThat(Files.readString(tempDir.resolve("book.fb2"))).isEqualTo("concurrent upload");
++        verify(bookAdditionalFileRepository, never()).save(any());
++        assertThat(uploadTemps()).isEqualTo(before);
++    }
++
++    @Test
++    void fb2ZipRollbackPreservesFileReplacedByAnotherWriter() throws Exception {
++        fb2Book(false);
++        TransactionSynchronizationManager.initSynchronization();
++        try {
++            service.uploadAdditionalFile(1L, zippedBook("book.fb2.zip"), true, null, null);
++            Path target = tempDir.resolve("book.fb2");
++            Files.delete(target);
++            Files.writeString(target, "replacement from another writer");
++            for (var callback : TransactionSynchronizationManager.getSynchronizations()) {
++                callback.afterCompletion(TransactionSynchronization.STATUS_ROLLED_BACK);
++            }
++            assertThat(Files.readString(target)).isEqualTo("replacement from another writer");
++        } finally {
++            TransactionSynchronizationManager.clearSynchronization();
++        }
++    }
++
+ }

@@ -1,0 +1,4 @@
+# Patches are applied in this order.
+0001-normalize-fb2zip-uploads.patch
+# Requires 0001: the server must normalize uploaded archives.
+0002-allow-fb2zip-in-upload-ui.patch

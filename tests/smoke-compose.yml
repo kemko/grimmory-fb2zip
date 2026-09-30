@@ -1,0 +1,49 @@
+services:
+  grimmory:
+    image: ${SMOKE_IMAGE:-grimmory-fb2zip:local}
+    environment:
+      USER_ID: 1000
+      GROUP_ID: 1000
+      TZ: Etc/UTC
+      DATABASE_URL: jdbc:mariadb://mariadb:3306/grimmory
+      DATABASE_USERNAME: grimmory
+      DATABASE_PASSWORD: smoke-only-password
+      SWAGGER_ENABLED: 'false'
+      LOGGING_LEVEL_ORG_BOOKLORE_SERVICE_LIBRARY: DEBUG
+    ports:
+      - '127.0.0.1::6060'
+    volumes:
+      - data:/app/data
+      - books:/books
+      - bookdrop:/bookdrop
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD', 'wget', '-q', '--spider', 'http://localhost:6060/api/v1/healthcheck']
+      interval: 5s
+      timeout: 5s
+      retries: 40
+      start_period: 20s
+  mariadb:
+    image: lscr.io/linuxserver/mariadb:11.4.8
+    environment:
+      PUID: 1000
+      PGID: 1000
+      TZ: Etc/UTC
+      MYSQL_ROOT_PASSWORD: smoke-only-root-password
+      MYSQL_DATABASE: grimmory
+      MYSQL_USER: grimmory
+      MYSQL_PASSWORD: smoke-only-password
+    volumes:
+      - database:/config
+    healthcheck:
+      test: ['CMD', 'mariadb-admin', 'ping', '-h', 'localhost']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+volumes:
+  data:
+  books:
+  bookdrop:
+  database:
